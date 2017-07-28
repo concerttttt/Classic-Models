@@ -1104,7 +1104,7 @@ class PTBModel(object):
                     tf.get_variable_scope().reuse_variables()
                 (cell_output,state) = cell(inputs[:,time_step,:],state)
                 outputs.append(cell_output)
-        output = tf.reshape(tf.concat(ouputs,1),[-1,size])
+        output = tf.reshape(tf.concat(outputs,1),[-1,size])
         softmax_w = tf.get_variable(
             "softmax_w",[size,vocab_size],dtype=tf.float32)
         softmax_b = tf.get_variable(
@@ -1256,16 +1256,677 @@ with tf.Graph().as_default():
         with tf.variable_score("Model",reuse=True,initializer=initializer):
             mtest = PTBInput(is_training = False,config = eval_config,
                              input_ = test_input)
-                              
+sv = tf.train.Supervisor()
+with sv.managed_session() as session:
+    for i in range(config.max_max_epoch):
+        lr_decay = config.lr_decay ** max(i+1-config.max_epoch,0.0)
+        m.assign_lr(session,config.learning_rate * lr_decay)
+        print("Epoch: %d Learning rate:%.3f"%(i+1,session.run(m.lr)))
+        train_perplexity = run_epoch(session,m,eval_op = m.train_op,verbose = True)
+        print("Epoch: %d Train Perplexity: %.3f"%(i+1,train_perplexity))
+        valid_perplexity = run_epoch(session,mvalid)
+        print("Epoch: %d Valid Perplexity: %.3f"%(i+1,valid_perplexity))
+        
+    test_perplexity = run_epoch(session,mtest)
+    print("Test Perplexity: %.3f" % test_perplexity)
+
+
+
+
+
+    
+#================== LSTM Classifier ====================
+import tensorflow as tf
+import numpy as np
+from tensorflow.examples.tutorials.mnist import input_data
+mnist = input_data.read_data_sets("/tmp/data/",one_hot = True)
+
+learning_rate = 0.01
+max_samples = 400000
+batch_size = 128
+display_step = 10
+
+n_input = 28
+n_steps = 28
+n_hidden = 256
+n_classes = 10
+
+x = tf.placeholder("float",[None,n_steps,n_input])
+y = tf.placeholder("float",[None,n_classes])
+
+weights = tf.Variable(tf.random_normal([2*n_hidden,n_classes]))
+biases = tf.Variable(tf.random_normal([n_classes])) 
+
+def BiRNN(x,weights,biases):
+    x = tf.transpose(x,[1,0,2])
+    x = tf.reshape(x,[-1,n_input])
+    x = tf.split(x,n_steps)
+    
+    lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(n_hidden,forget_bias=1.0)
+    lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_hidden,forget_bias=1.0)
+    outputs,_,_ = tf.contrib.rnn.static_bidirectional_rnn(lstm_fw_cell,lstm_bw_cell,x,dtype = tf.float32)
+    return tf.matmul(outputs[-1],weights) + biases
+    
+pred = BiRNN(x,weights,biases)
+cost = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=pred,labels=y))
+optimizer=tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(cost)
+
+correct_pred=tf.equal(tf.argmax(pred,1),tf.argmax(y,1))
+accuracy = tf.reduce_mean(tf.cast(correct_pred,tf.float32))
+init = tf.global_variables_initializer()
+
+with tf.Session() as sess:
+    sess.run(init)
+    step = 1
+    while step * batch_size < max_samples:
+        batch_x, batch_y = mnist.train.next_batch(batch_size)
+        batch_x = batch_x.reshape((batch_size,n_steps,n_input))
+        sess.run(optimizer,feed_dict={x:batch_x,y:batch_y})
+        if step % display_step == 0:
+            acc = sess.run(accuracy, feed_dict={x:batch_x,y:batch_y})
+            loss = sess.run(cost,feed_dict={x:batch_x,y:batch_y})
+            print("Iter "+str(step*batch_size)+",Minibatch Loss="+"{:.6f}".format(loss) + \
+            ",Training Accuracy = " + \
+            "{:.5f}".format(acc))
+        step += 1
+    print("Optimization Finished")
+    
+    test_len = 10000
+    test_data = mnist.test.images[:test_len].reshape((-1,n_steps,n_input))
+    test_label = mnist.test.labels[:test_len]
+    print("Testing Accuracy:",sess.run(accuracy,feed_dict={x:test_data,y:test_label}))
+    
 
 
 
 
 
 
+#========================= Policy Network ================
+'''
+pip install gym
+'''
+
+
+import numpu as np
+import tensorflow as tf
+import gym
+env = gym.make('CartPole-v0')
+
+env.reset()
+random_episodes = 0
+reward_sum = 0
+while random_episodes < 10:
+    env.render()
+    observation,reward,done,_ = env.step(np.random.randint(0,2))
+    reward_sum += reward
+    if done:
+        random_episodes += 1
+        print("Reward for this episode was:",reward_sum)
+        reward_sum = 0
+        env.reset()
+
+H = 50
+batch_size = 25
+learning_rate = 1e-1
+D = 4
+gamma = 0.99
+
+observations = tf.placeholder(tf.float32,[None,D],name = "input_x")
+w1 = tf.get_variable('w1',shape=[D,H],initializer = tf.contrib.layers.xavier_initializer())
+layer1 = tf.nn.relu(tf.matmul(observations,w1))
+w2 = tf.get_variable('w2',shape=[H,1],initializer=tf.contrib.layers.xavier_initializer())
+score = tf.matmul(layer1,w2)
+probability = tf.nn.sigmoid(score)
+
+adam = tf.train.AdamOptimizer(learning_rate = learning_rate)
+w1grad = tf.placeholder(tf.float32,name='batch_grad1')
+w2grad = tf.placeholder(tf.float32,name='batch_grad2')
+batchGrad = [w1grad,w2grad]
+updateGrads = adam.apply_gradients(zip(batchGrad,tvars))
+
+def discount_rewards(r):
+    discounted_r = np.zeros_like(r)
+    running_add = 0
+    for t in reversed(range(r.size)):
+        running_add = running_add * gamma + r[t]
+        discounted_r[t] = running_add
+    return discounted_r
+    
+input_y = tf.placeholder(tf.float32,[None,1],name='input_y')
+advantages = tf.placeholder(tf.float32,name='reward_signal')
+loglik = tf.log(input_y * (input_y - probability) + \
+                (1-input_y)*(input_y + probability))
+loss = -tf.reduce_mean(loglik*advantages)
+
+tvars = tf.trainable_variables()
+newGrads = tf.gradient(loss,tvars)
+
+xs,ys,drs = [],[],[]
+reward_sum = 0
+episode_number = 1
+total_episode = 10000
+
+with tf.Session() as sess:
+    rendering = False
+    init = tf.global_variables_initializer()
+    sess.run(init)
+    observation = env.reset()
+    
+    gradBuffer = sess.run(tvars)
+    for ix,grad in enumerate(gradBuffer):
+        gradBuffer[ix] = grad * 0
+    while episode_number <= total_episode:
+        if reward_sum/batch_size > 100 or rendering == True:
+            env.render()
+            rendering = True
+        x = np.reshape(observation,[1,D])
+        tfprob = sess.run(probability,feed_dict)
+        action = 1  if np.random.uniform() < tfprob else 0
+        
+        xs.append(x)
+        y = 1 - action
+        ys.append(y)
+        observation,reward,done,info = env.step(action)
+        reward_sum += reward
+        drs.append(reward)
+        if done:
+            episode_number += 1
+            epx = np.vstack(xs)
+            epy = np.vstack(ys)
+            epr = np.vstack(drs)
+            xs,ys,drs = [],[],[]
+            discounted_epr = discount_rewards(epr)
+            discounted_epr -= np.mean(discounted_epr)
+            discounted_epr /= np.std(discounted_epr)
+            tGrad = sess.run(newGrads,feed_dict={observations:epx,
+                                                 input_y:epy,
+                                                 advantages:discounted_epr})
+            for ix,grad in enumerate(tGrad):
+                gradBuffer[ix] += grad
+            if episode_number % batch_size == 0:
+                sess.run(updateGrads,feed_dict={w1grad:gradBuffer[0],
+                                                w2grad:gradBuffer[1]})
+                for ix,grad in enumerate(gradBuffer):
+                    gradBuffer[ix] = grad * 0
+                    
+                print("Average reward for episode %d:%f."%\
+                    (episode_number,reward_sum/batch_size))
+                if reward_sum/batch_size > 200:
+                    print("Task solved in",episode_number,'episodes!')
+                    break
+                reward_sum = 0
+            observation = env.reset()
+            
+            
+        
+#================ Value Network ===================
+        
+import numpy as np
+import random
+import itertools
+import scipy.misc
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import os
+
+class gameOb():
+    def __init__(self,coordinates,size,intensity,channel,reward,name):
+        self.x = coordinates[0]
+        self.y = coordinates[1]
+        self.size = size
+        self.intensity = intensity
+        self.channel = channel
+        self.reward = reward
+        self.name = name
+		
+class gameEnv():
+    def __init__(self,size):
+        self.sizeX = size
+        self.sizeY = size
+        self.actions = 4
+        self.objects = []
+        a = self.reset()
+        plt.imshow(a,interpolation = "nearest")
+		
+    def reset(self):
+        self.objects = []
+        hero = gameOb(self.newPostition(),1,1,2,None,'hero')
+        self.objects.append(hero)
+        goal = gameOb(self.newPostition(),1,1,1,1,'goal')
+        self.objects.append(goal)
+        hole = gameOb(self.newPostition(),1,1,0,-1,'fire')
+        self.objects.append(hole)
+        goal2 = gameOb(self.newPostition(),1,1,1,1,'goal')
+        self.objects.append(goal2)
+        hole2 = gameOb(self.newPostition(),1,1,0,-1,'fire')
+        self.objects.append(hole2)
+        goal3 = gameOb(self.newPostition(),1,1,1,1,'goal')
+        self.objects.append(goal3)
+        goal4 = gameOb(self.newPostition(),1,1,1,1,'goal')
+        self.objects.append(goal4)
+        state = self.renderEnv()
+        self.state = state
+        return state
+		
+    def moveChar(self,direction):
+        hero = self.objects[0]
+        heroX = hero.x
+        heroY = hero.y
+        if direction == 0 and hero.y >= 1:
+            hero.y -= 1
+        if direction == 1 and hero.y <= self.sizeY - 2:
+            hero.y += 1
+        if direction == 2 and hero.x >= 1:
+            hero.x -= 1
+        if direction == 3 and hero.x <= self.sizeX - 2:
+            hero.x += 1
+        self.objects[0] = hero
+		
+    def newPostition(self):
+        iterables = [range(self.sizeX),range(self.sizeY)]
+        points = []
+        for t in itertools.product(*iterables):
+            points.append(t)
+            currentPositions = []
+        for objectA in self.objects:
+            if (objectA.x,objectA.y) not in currentPositions:
+                currentPositions.append((objectA.x,objectA.y))
+        for pos in currentPositions:
+            points.remove(pos)
+        location = np.random.choice(range(len(points)),replace=False)
+        return points[location]
+    
+    def checkGoal(self):
+        others = []
+        for obj in self.objects:
+            if 'hero' == obj.name:
+                hero = obj
+            else:
+                others.append()
+        for other in others:
+            if hero.x == other.x and hero.y == other.y:
+                self.objects.remove(other)
+                if 1 == other.reward:
+                    self.objects.append(gameOb(self.newPostition(),1,1,1,1,'goal'))
+                else:
+                    self.objects.append(gameOb(self.newPostition(),1,1,0,-1,'fire'))
+        return 0.0,False
+        
+    def renderEnv(self):
+        a = np.ones([self.sizeX + 2,self.sizeY + 2,3])
+        a[1:-1,1:-1,:] = 0
+        hero = None
+        for item in self.objects:
+            a[item.y+1:item.y+item.size+1,item.x+1:item.x+item.size+1,item.channel] = item.intensity
+        b = scipy.misc.imresize(a[:,:,0],[84,84,1],interp='nearest')
+        c = scipy.misc.imresize(a[:,:,1],[84,84,1],interp='nearest') 
+        d = scipy.misc.imresize(a[:,:,2],[84,84,1],interp='nearest')
+        a = np.stack([b,c,d],axis=2)
+        return a
+        
+    def step(self,action):
+        self.moveChar(action)
+        reward,done = self.checkGoal()
+        state = self.renderEnv()
+        return state,reward,done
+    
+env = gameEnv(size = 5)
+
+class Qnetwork():
+    def __init__(self,h_size):
+        self.scalarInput = tf.placeholder(shape=[None,21168],
+                                          dtype=tf.float32)
+        self.imageIn = tf.reshape(self.scalarInput,shape=[-1,84,84,3])
+        self.conv1 = tf.contrib.layers.convolution2d(
+            inputs = self.imageIn,num_outputs=32,
+            kernel_size=[8,8],stride=[4,4],
+            padding='VALID',biases_initializer=None)
+        self.conv2 = tf.contrib.layers.convolution2d(
+            inputs = self.conv1,num_outputs=64,kernel_size=[4,4],stride=[2,2],
+            padding='VALID',biases_initializer=None)
+        self.conv3 = tf.contrib.layer.convolution2d(
+            inputs = self.conv2,num_outputs=64,kernel_size=[3,3],stride=[1,1],
+            padding='VALID',biases_initializer=None)
+        self.conv4 = tf.contrib.layers.conv2d(
+            inputs=self.conv3,num_outputs=512,
+            kernel_size=[7,7],stride=[1,1],
+            padding='VALID',biases_initializer=None)
+        self.streamAC,self.streamVC = tf.split(self.conv4,2,3)
+        self.streamA = tf.contrib.layers.flatten(self.streamAC)
+        self.streamV = tf.contrib.layers.flatten(self.streamVC)
+        self.AW = tf.Variable(tf.random_normal([h_size//2,env.actions]))
+        self.VW = tf.Variable(tf.random_normal([h_size//2,1]))
+        self.Advantage = tf.matmul(self.streamA,self.AW)
+        self.Value = tf.matmul(self.streamV,self.VW)
+        
+        self.Qout = self.Value + tf.subtract(self.Advantage,tf.reduce_mean(
+            self.Advantage,reduction_indices=1,keep_dims=True))
+        self.predict = tf.argmax(self.Qout,1)
+        self.targetQ = tf.placeholder(shape=[None],dtype=tf.float32)
+        self.actions = tf.placeholder(shape=[None],dtype=tf.int32)
+        self.actions_onehot = tf.one_hot(self.actions,env.actions,dtype=tf.float32)
+        self.Q = tf.reduce_sum(tf.multiply(self.Qout,self.actions_onehot),reduction_indices=1)
+        self.td_error = tf.square(self.targetQ-self.Q)
+        self.loss = tf.reduce_mean(self.td_error)
+        self.trainer = tf.train.AdamOptimizer(learning_rate=0.0001)
+        self.updateModel = self.trainer.minimize(self.loss)
+
+class experience_buffer():
+    def __init__(self,buffer_size = 50000):
+        self.buffer = []
+        self.buffer_size = buffer_size
+    def add(self,experience):
+        if len(self.buffer) + len(experience) >= self.buffer_size:
+            self.buffer[0:(len(experience) + len(self.buffer) - self.buffer_size)] = []
+            self.buffer.extend(experience)
+    def sample(self,size):
+        return np.reshape(np.array(random.sample(self.buffer_size)),[size,5])
+    
+def processState(states):
+    return np.reshape(states,[21168])
+
+def updateTargetGraph(tfVars,tau):
+    total_vars = len(tfVars)
+    op_holder = []
+    for idx,var in enumerate(tfVars[0:total_vars//2]):
+        op_holder.append(tfVars[idx+total_vars//2].assign((var.value()*tau)+\
+            ((1-tau)*tfVars[idx+total_vars//2].value())))
+    return op_holder
+    
+def updateTarget(op_holder,sess):
+    for op in op_holder:
+        sess.run(op)
+
+batch_size = 32
+update_freq = 4
+y = .99
+startE = 1
+endE = 0.1
+annealing_steps = 10000
+num_episodes = 10000
+pre_train_steps = 10000
+max_epLength = 50
+load_model = False
+path = "./dqn"
+h_size = 512
+tau = 0.001
+
+mainQN = Qnetwork(h_size)
+targetQN = Qnetwork(h_size)
+init = tf.global_variables_initializer()
+
+trainables = tf.trainable_variables()
+targetOps = updateTargetGraph(trainables,tau)
+
+mybuffer = experience_buffer()
+e = startE
+stepDrop = (startE - endE) / annealing_steps
+
+rList = []
+total_steps = 0
+saver = tf.train.Saver()
+if not os.path.exists(path):
+    os.makedirs(path)
+
+with tf.Session() as sess:
+    if load_model == True:
+        print("loading model...")
+        ckpt = tf.train.get_checkpoint_state(path)
+        saver.restore(sess,ckpt.model_checkpoint_path)
+    saver.run(init)
+    updateTarget(targetOps,sess)
+    for i in range(num_episodes+1):
+        episodeBuffer = experience_buffer()
+        s = env.reset()
+        s = processState(s)
+        d = False
+        rAll = 0
+        j = 0
+        while j < max_epLength:
+            j += 1
+            if np.random.rand(1) < e or total_steps < pre_train_steps:
+                a = np.random.randint(0,4)
+            else:
+                a = sess.run(mainQN.predict,
+                             feed_dict = {mainQN.scalarInput:[s]})[0]
+            s1,r,d = env.step(a)
+            s1 = processState(s1)
+            total_steps += 1
+            episodeBuffer.add(np.reshape(np.array([s,a,r,s1,d]),[1,5]))
+            if total_steps > pre_train_steps:
+                if e > endE:
+                    e -= stepDrop
+            if total_steps % (update_freq) == 0:
+                trainBatch = mybuffer.sample(batch_size)
+                A = sess.run(mainQN.predict,feed_dict={
+                    mainQN.scalarInput:np.vstack(trainBatch[:,3])})
+                Q = sess.run(targetQN.Qout,feed_dict={
+                    targetQN.scalarInput:np.vstack(trainBatch[:,3])})
+                doubleQ = Q[range(batch_size),A]
+                targetQ = trainBatch[:,2] + y*doubleQ
+                _ = sess.run(mainQN.updateModel,feed_dict={
+                    mainQN.scalarInput:np.vstack(trainBatch[:,0]),
+                    mainQN.targetQ:targetQ,
+                    mainQN.actions:trainBatch[:,1]})
+                updateTarget(targetOps,sess)
+            rAll += r
+            s = s1
+            if d == True:
+                break
+        mybuffer.add(episodeBuffer.buffer)
+        rList.append(rAll)
+        if i > 0 and i % 25 ==0:
+            print('episode',i,', average reward of last 25 episode',
+                  np.mean(rList[-25:]))
+        if i > 0 and i % 1000 == 0:
+            saver.save(sess,path+'/model-'+str(i)+'.cptk')
+            print("save model")
+    saver.save(sess,path+'/model-',str(i)+'.cptk')
+
+rMat = np.resize(np.array(rList),[len(rList)//100,100])
+rMean = np.average(rMat,1)
+plt.plot(rMean)
 
 
 
+#============================= Tensorboard ==================
+
+import tensorflow as tf
+from tensorflow.examples.tutorials.mnist import input_data
+max_steps = 1000
+learning_rate = 0.001
+dropout = 0.9
+data_dir = '/tmp/tensorflow/mnist/input_data'
+log_dir = '/tmp/tensorflow/mnist/logs/mnist_with_summaries'
+
+mnist = input_data.read_data_sets(data_dir,one_hot = True)
+sess = tf.InteractiveSession()
+
+with tf.name_scope('input'):
+    x = tf.placeholder(tf.float32,[None,784],name = 'x-input')
+    y_ = tf.placeholder(tf.float32,[None,10],name = 'y-input')
+with tf.name_scope('input_reshape'):
+    image_shaped_input = tf.reshape(x,[-1,28,28,1])
+    tf.summary.image('input',image_shaped_input,10)
+
+def weight_variable(shape):
+    initial = tf.truncated_normal(shape,stddev=0.1)
+    return tf.Variable(initial)
+
+def bias_variable(shape):
+    initial = tf.Constant(0.1,shape=shape)
+    return tf.Variable(initial)
+    
+def variable_summaries(var):
+    with tf.name_scope('summaries'):
+        mean = tf.reduce_mean(var)
+        tf.summary.scalar('mean',mean)
+        with tf.name_scope('stddev'):
+            stddev = tf.sqrt(tf.reduce_mean(tf.square(var - mean)))
+        tf.summary.scalar('stddev',stddev)
+        tf.summary.scalar('max',tf.reduce_max(var))
+        tf.summary.scalar('min',tf.reduce_min(var))
+        tf.summary.histogram('histogram',var)
+
+def nn_layer(input_tensor,input_dim,output_dim,layer_name,act=tf.nn.relu):
+    with tf.name_scope(layer_name):
+        with tf.name_scope('weights'):
+            weights = weight_variable([input_dim,output_dim])
+            variable_summaries(weights)
+        with tf.name_scope('biases'):
+            biases = bias_variable([output_dim])
+            variable_summaries(biases)
+        with tf.name_scope('wx_plus_b'):
+            preactivate = tf.nn.bias_add(tf.matmul(input_tensor,weights),biases)
+            tf.summary.histogram('pre_activations',preactivate)
+        activations = act(preactivate,name='activation')
+        tf.summary.histogram('activations',activations)
+        return activations
+        
+hidden1 = nn_layer(x,784,784,'layer_1')
+with tf.name_scope('dropout'):
+    keep_prob = tf.placeholder(tf.float32)
+    tf.summary.scalar('dropout_rate',keep_prob)
+    dropped = tf.nn.dropout(hidden1,keep_prob)
+y = nn_layer(dropped,500,10,'layer_2',act=tf.identity)
+
+with tf.name_scope('cross_entropy'):
+    diff = tf.nn.softmax_cross_entropy_with_logits(logits=y,lables=y)
+    with tf.name_scope('total'):
+        cross_entropy = tf.reduce_mean(diff)
+tf.summary.scalar('cross_entropy',cross_entropy)
+
+with tf.name_scope('train'):
+    train_step = tf.train.AdamOptimizer(learning_rate).minimize(cross_entropy)
+with tf.name_scope('accracy'):
+    with tf.name_scope('correct_prediction'):
+        correct_prediction = tf.equal(tf.argmax(y,1),tf.argmax(y_,1))
+    with tf.name_scope('accuracy'):
+        accuracy = tf.reduce_mean(tf.cast(correct_prediction,tf.float32))
+tf.summary.scalar('accuray',accuracy)
+
+merged = tf.summary.merge_all()
+train_writer = tf.summary.FileWriter(log_dir+'/train',sess.graph)
+test_writer = tf.summary.FileWriter(log_dir+'/test')
+tf.global_variables_initializer().run()
+
+def feed_dict(train):
+    if train:
+        xs,ys = mnist.train.next_batch(100)
+        k = dropout
+    else:
+        xs,ys = mnist.test.images,mnist.test.labels
+        k = 1.0
+    return {x:xs,y_:ys,keep_prob:k}
+
+saver = tf.train.Saver()
+for i in range(max_steps):
+    if i%10 == 0:
+        summary,acc = sess.run([merged,accuracy],feed_dict=feed_dict(False))
+        test_writer.add_summary(summary,i)
+        print('Accuracy at step %s:%s'%(i,acc))
+    else:
+        if i%100 == 99:
+            run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+            run_metadata = tf.RunMetadata()
+            summary,_ = sess.run([merged,train_step],
+                                 feed_dict=feed_dict(True),
+                                 options = run_options,
+                                 run_metadata=run_metadata)
+            train_writer.add_run_metadata(run_metadata,'step%03d'%i)
+            train_writer.add_summary(summary,i)
+            saver.save(sess,log_dir+"/model.ckpt",i)
+            print('Adding run metadata for',i)
+        else:
+            summary,_ = sess.run([merged,train_step],feed_dict=feed_dict(True))
+            train_writer.add_summary(summary,i)
+train_writer.close()
+test_writer.close()
+
+#tensorboard --logdir=/tmp/tensorflow/mnist/logs/mnist_with_summaries
+
+            
+            
+#========================== multiple gpu ==========================
+import os.path
+import re
+import time
+import numpy as np
+import tensorflow as tf
+import cifar10
+
+batch_size = 128
+max_steps = 1000000
+num_gpus = 4
+
+def tower_loss(scope):
+    images,labels = cifar10.distorted_inputs()
+    logits = cifar10.inference(images)
+    _ = cifar10.loss(logits,labels)
+    losses = tf.get_collections('losses',scope)
+    total_loss = tf.add_n(losses,name='total_loss')
+    return total_loss
+
+def average_gradient(tower_grads):
+    average_grads = []
+    for grad_and_vars in zip(*tower_grads):
+        grads = []
+        for g,_ in grad_and_vars:
+            expanded_g = tf.expand_dims(g,0)
+            grads.append(expanded_g)
+        
+        grad = tf.concat(grads,0)
+        grad = tf.reduce_mean(grad,0)
+        v = grad_and_vars[0][1]
+        grad_and_var = (grad,v)
+        average_grads.append(grad_and_var)
+    return average_grads
+    
+def train():
+    with tf.Graph().as_default(),tf.device('/cpu:0'):
+        global_step = tf.get_variable('global_step',[],
+                                        initializer=tf.constant_initializer(0),
+                                        trainable=False)
+        num_batches_per_epoch = cifar10.NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN/batch_size
+        decay_steps = int(num_batches_per_epoch * cifar10.NUM_EPOCHS_PER_DECAY)
+        lr = tf.train.exponential_decay(cifar10.INITIAL_LEARNING_RATE,
+                                        global_step,
+                                        decay_steps,
+                                        cifar10.LEARNING_RATE_DECAY_FACTOR,
+                                        staircase=True)
+        opt = tf.train.GradientDescentOptimizer(lr)
+        tower_grads = []
+        for i in range(num_gpus):
+            with tf.device('/gpu:%d'%i):
+                with tf.name_scope('%s_%d'%(cifar10.TOWER_NAME,i)) as scope:
+                    loss = tower_loss(scope)
+                    tf.get_variable_scope().reuse_variables()
+                    grads = opt.compute_gradients(loss)
+                    tower_grads.append(grads)
+        grads = average_gradient(tower_grads)
+        apply_gradient_op = opt.apply_gradients(grads,global_step=global_step)
+        saver = tf.train.Saver(tf.all_variables())
+        init = tf.global_variables_initialzer()
+        sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
+        sess.run(init)
+        tf.train.start_queue_runners(sess=sess)
+        for step in range(max_steps):
+            start_time = time.time()
+            _,loss_value = sess.run([apply_gradient_op,loss])
+            duration = time.time() - start_time
+            if step % 10 == 0:
+                num_examples_per_step = batch_size * num_gpus
+                examples_per_sec = num_examples_per_step / duration
+                sec_per_batch = duration / num_gpus
+                
+                format_str = ('step%d,loss=%.2f(%.1f examples/sec);%.3fsec/batch')
+                print(format_str%(step,loss_value,examples_per_sec,sec_per_batch))
+            if step % 1000 == 0 or (step+1) == max_steps:
+                saver.save(sess,'/tmp/cifar10_train/model.ckpt',global_step=step)
+cifar10.maybe_download_and_extract()
+
+train()
 
 
 
